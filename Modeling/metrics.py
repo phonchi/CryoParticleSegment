@@ -30,16 +30,16 @@ class ConfusionMatrix():
 
   def get_row_accuracy(self):
     """Returns the row accuracy."""
-    return self.confmat.diag() / self.confmat.sum(1)
+    return self.confmat.diag() / self.confmat.sum(0)
 
   def get_recall(self):
     """Returns the recall."""
-    return self.confmat.diag() / self.confmat.sum(0)
+    return self.confmat.diag() / self.confmat.sum(1)
 
   def get_f1_score(self):
     """Returns the F1 score."""
-    precision = self.confmat.diag() / self.confmat.sum(1)
-    recall = self.confmat.diag() / self.confmat.sum(0)
+    precision = self.confmat.diag() / self.confmat.sum(0)
+    recall = self.confmat.diag() / self.confmat.sum(1)
     return 2 * (precision * recall) / (precision + recall)
 
   def get_row_iou(self):

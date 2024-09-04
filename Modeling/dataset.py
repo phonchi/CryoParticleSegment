@@ -12,95 +12,132 @@ import torchvision.transforms.functional as TF
 __all__ = [
   "get_slice_points",
   "reconstruct_patched",
+  "collate_fn",
   "MicrographDataset",
+  "MicrographDatasetSingle",
   "MicrographDatasetEvery"
 ]
 
-def get_slice_points(image_size, crop_size):
-  """
-  Obtain the grid that can split image width or height into multiple ticks.
-  
-  Args:
-    image_size (int): the width or the height of the image.
-    crop_size (int): the width or the height of the cropped image.
+def create_weight_map(crop_size, bandwidth=None):
+    """Create a Gaussian-like weight map which emphasizes the center of the patch.
+    
+    Args:
+        crop_size (int): The size of the crop (assumed to be square for simplicity).
+        bandwidth (int, optional): Defines the transition area from edge to center.
+                                   Smaller values make the transition sharper.
+                                   If None, it defaults to crop_size // 4.
+    """
+    if bandwidth is None:
+        bandwidth = crop_size // 16  # Default bandwidth
 
-  Examples::
-
-    >>> image.shape
-    torch.Size([3, 281, 500])
-    >>> crop_size = (64, 128)
-    >>> get_slice_points(image.size[-2], crop_size[-2])
-    tensor([  0,  57, 114, 171, 228])
-    >>> get_slice_points(image.size[-1], crop_size[-1])
-    tensor([  0, 125, 250, 375])
-  """
-  num = math.ceil(image_size / crop_size)
-  return torch.arange(0, image_size, math.ceil(image_size/num))
-  # Following code is depricated since 2023/12/19.
-  #   redundent = math.ceil((num * crop_size - image_size)/num) # might be wrong
-  #   return torch.tensor([*range(0, image_size-crop_size, crop_size - redundent), image_size-crop_size])
-  # This image demonstrate the idea of the code. 
-  #   ┌──┬──┬──┬──┬────┐
-  #   ├──┼──┼──┼──┼────┤
-  #   ├──┼──┼──┼──┼────┤
-  #   ├──┼──┼──┼──┼────┤
-  #   ├──┼──┼──┼──┼────┤
-  #   │  │  │  │  │    │
-  #   └──┴──┴──┴──┴────┘
-  # problem found 2023/12/19:
-  # print((512*8-3840)/8, (3840-3840//512*512)/8)
-  # print((64*8-499)/8, (499-499//64*64)/8)
+    ramp = torch.linspace(0, 1, bandwidth)
+    ramp = torch.cat([ramp, torch.ones(crop_size - 2 * bandwidth), ramp.flip(0)])
+    weight_map = ramp[:, None] * ramp[None, :]
+    return weight_map
 
 
-def reconstruct_patched(images, grid):
-  """
-  Reconstruct image or feature maps from patches with a specified grid.
-  
-  Args:
-    images (Tensor): patched images or feature maps.
-    grid (Tensor): grid.
+def get_slice_points(image_size, crop_size, overlap):
+    """ Calculate the slice points for cropping the image into overlapping patches. """
+    step = crop_size - overlap
+    num_points = (image_size - crop_size) // step + 1
+    last_point = image_size - crop_size
+    points = torch.arange(0, step * num_points, step)
+    if points[-1] != last_point:
+        points = torch.cat([points, torch.tensor([last_point])])
+    return points
 
-  Examples::
 
-    >>> image.shape
-    torch.Size([3, 281, 500])
-    >>> crop_size = (64, 128)
-    >>> patched_images.shape
-    torch.Size([20, 3, 64, 128])
-    >>> grid
-    tensor([[[  0,   0,   0,   0,   0],
-             [ 57,  57,  57,  57,  57],
-             [114, 114, 114, 114, 114],
-             [171, 171, 171, 171, 171],
-             [228, 228, 228, 228, 228],
-             [281, 281, 281, 281, 281]],
+def reconstruct_patched(images, structured_grid, bandwidth=None):
+    if bandwidth is None:
+        bandwidth = images.shape[2] // 16  # Adjust this based on your needs
 
-            [[  0, 125, 250, 375, 500],
-             [  0, 125, 250, 375, 500],
-             [  0, 125, 250, 375, 500],
-             [  0, 125, 250, 375, 500],
-             [  0, 125, 250, 375, 500],
-             [  0, 125, 250, 375, 500]]])
-    >>> get_slice_points(patched_images, grid).shape
-    torch.Size([3, 281, 500])
-  """
-  i_num = grid.size(-2)-1
-  j_num = grid.size(-1)-1
-  return torch.concatenate([
-    torch.concatenate([
-      TF.crop(images[j_num*i_idx+j_idx], top=0, left=0,
-              height=grid[0, i_idx+1, j_idx]-grid[0, i_idx, j_idx], 
-              width=grid[1, i_idx, j_idx+1]-grid[1, i_idx, j_idx]) \
-      for j_idx in range(j_num)
-    ], dim=-1) for i_idx in range(i_num)
-  ], dim=-2)
+    weight_map = create_weight_map(images.shape[2], bandwidth).to(images.device)
+    max_height = structured_grid[0, -1] + images.shape[2]
+    max_width = structured_grid[1, -1] + images.shape[3]
+    reconstructed_image = torch.zeros((images.shape[1], max_height, max_width), device=images.device)
+    weights = torch.zeros_like(reconstructed_image)
+
+    # Process in batches
+    batch_size = 32  # Adjust this depending on your GPU capacity
+    num_batches = (images.shape[0] + batch_size - 1) // batch_size  # Compute number of batches
+
+    for batch_index in range(num_batches):
+        batch_start = batch_index * batch_size
+        batch_end = min(batch_start + batch_size, images.shape[0])
+        batch_images = images[batch_start:batch_end]
+        batch_structured_grid = structured_grid[:, batch_start:batch_end]
+
+        for idx, (start_i, start_j) in enumerate(zip(batch_structured_grid[0].flatten(), batch_structured_grid[1].flatten())):
+            end_i = start_i + images.shape[2]
+            end_j = start_j + images.shape[3]
+            reconstructed_image[:, start_i:end_i, start_j:end_j] += batch_images[idx] * weight_map
+            weights[:, start_i:end_i, start_j:end_j] += weight_map
+
+    reconstructed_image /= weights.clamp(min=1)
+    return reconstructed_image
+
+
+def collate_fn(batch):
+    images, masks = [], []
+    for b in batch:
+        for image, mask in b:
+            images.append(image)
+            masks.append(mask)
+    return torch.stack(images), torch.stack(masks)
 
 class MicrographDataset(Dataset):
+  """
+  Dataset for cryo-EM dataset that returns multiple patches per image.
+  """
+  def __init__(self, image_dir, label_dir, filenames=None, crop_size=(512, 512), num_patches=1, img_ext='.npy', crop=None):
+      self.image_dir = image_dir
+      self.label_dir = label_dir
+      self.num_patches = num_patches
+      self.crop_size = crop_size
+      if filenames is not None:
+          self.filenames = filenames
+      else:
+          self.filenames = sorted(os.listdir(image_dir))
+      basenames = [os.path.splitext(filename)[0] for filename in self.filenames]
+      self.images = [os.path.join(image_dir, basename + img_ext) for basename in basenames]
+      self.labels = [os.path.join(label_dir, basename + '.png') for basename in basenames]
+      if crop is None:
+          self.crop = transforms.CenterCrop(3840)  # Adjust based on your specific needs
+      else:
+          self.crop = crop
+
+  def __len__(self):
+      return len(self.images)
+
+  def __getitem__(self, idx):
+      mask = TF.to_tensor(Image.open(self.labels[idx]).convert("L"))
+      image = torch.from_numpy(np.load(self.images[idx]).reshape((-1, mask.shape[1], mask.shape[2])))  # Assume images are 4096x4096
+
+      patches = []
+      for _ in range(self.num_patches):
+          image_cropped, mask_cropped = self.transform(image, mask)
+          patches.append((image_cropped, mask_cropped.long()))
+      
+      return patches
+
+  def transform(self, image, mask):
+      if self.crop:
+          image = self.crop(image)
+          mask = self.crop(mask)
+      
+      i, j, h, w = transforms.RandomCrop.get_params(image, output_size=self.crop_size)
+      image = TF.crop(image, i, j, h, w)
+      mask = TF.crop(mask, i, j, h, w)
+      #mask = torch.concat([1 - mask, mask], dim=0)  # For two-class problem: background and foreground
+      
+      return image, mask
+
+class MicrographDatasetSingle(Dataset):
   """
   Dataset for cryo-EM dataset.
   The micrographs and ground truths will be random crop to `crop_size`.
   """
-  def __init__(self, image_dir, label_dir, filenames=None, crop_size=(512, 512), img_ext='.npy', crop=None):
+  def __init__(self, image_dir, label_dir, filenames=None, crop_size=(512, 512), img_ext='.npy', crop=3840):
     self.image_dir = image_dir
     self.label_dir = label_dir
     if filenames is not None:
@@ -110,10 +147,10 @@ class MicrographDataset(Dataset):
     basenames = [os.path.splitext(filename)[0] for filename in filenames]
     self.images = [os.path.join(image_dir, basename+img_ext) for basename in basenames]
     self.labels = [os.path.join(label_dir, basename+'.png') for basename in basenames]
-    if crop is None: # To be formalized.
+    if crop: # To be formalized.
       self.crop = transforms.CenterCrop(3840) # = 4096-256, uses because of the property of EMPIAR-10017
     else:
-      self.crop = crop
+      self.crop = None
     self.crop_size = crop_size
 
   def __len__(self):
@@ -121,22 +158,23 @@ class MicrographDataset(Dataset):
 
   def __getitem__(self, idx):
     mask = TF.to_tensor(Image.open(self.labels[idx]).convert("L"))
-    image = torch.from_numpy(np.load(self.images[idx]).reshape((-1,4096,4096))) # (4096, 4096) is the image size of micrographs EMPIAR-10017
+    image = torch.from_numpy(np.load(self.images[idx]).reshape((-1,mask.shape[1], mask.shape[2]))) # (4096, 4096) is the image size of micrographs EMPIAR-10017
+    #mask = mask.long()
     return self.transform(image, mask)
 
   def transform(self, image, mask):
-    image = self.crop(image)
-    mask = self.crop(mask)
+    if self.crop:
+        image = self.crop(image)
+        mask = self.crop(mask)
 
     i, j, h, w = transforms.RandomCrop.get_params(
       image, output_size=self.crop_size)
     image = TF.crop(image, i, j, h, w)
     mask = TF.crop(mask, i, j, h, w)
-    mask = torch.concat([1-mask, mask], dim=0) # Remove this line if background is not consider.
+    #mask = torch.concat([1-mask, mask], dim=0) # Remove this line if background is not consider.
+    return image, mask.long()
 
-    return image, mask
-
-class MicrographDatasetEvery(MicrographDataset):
+class MicrographDatasetEvery(MicrographDatasetSingle):
   """
   Dataset for cryo-EM dataset.
   The micrographs and ground truths will be divided into grid.
@@ -145,24 +183,31 @@ class MicrographDatasetEvery(MicrographDataset):
     super().__init__(*arg, **kwarg)
 
   def transform(self, image, mask):
-    image = self.crop(image)
-    mask = self.crop(mask)
+    if self.crop:
+        image = self.crop(image)
+        mask = self.crop(mask) #CenterCrop
 
-    grid_i = get_slice_points(image_size=image.size(-2), crop_size=self.crop_size[-2])
-    grid_j = get_slice_points(image_size=image.size(-1), crop_size=self.crop_size[-1])
+    image_dims = (image.size(-2), image.size(-1))
+    crop_dims = (self.crop_size[-2], self.crop_size[-1])
+    overlap_size = 64
+    # Cache grid calculations to avoid redundancy
+    #if (image_dims, crop_dims) not in self.slice_points_cache:
+    grid_i = get_slice_points(image.size(-2), self.crop_size[-2], overlap_size)
+    grid_j = get_slice_points(image.size(-1), self.crop_size[-1], overlap_size)
     grid = torch.cartesian_prod(grid_i, grid_j)
-    images = [TF.crop(image, i, j, *self.crop_size) for i, j in grid]
-    masks = [TF.crop(mask, i, j, *self.crop_size) for i, j in grid]
-    images = torch.stack(images, dim=0)
-    masks = torch.stack(masks, dim=0)
-    grid = torch.stack([
-      TF.pad(TF.pad(
-        grid_i.repeat(len(grid_j),1).T, padding=(0,0,0,1), fill=image.shape[-2]
-        ), padding=(0,0,1,0), padding_mode="edge"),
-      TF.pad(TF.pad(
-        grid_j.repeat(len(grid_i),1), padding=(0,0,1,0), fill=image.shape[-1]
-        ), padding=(0,0,0,1), padding_mode="edge")
-      ], dim=0)
-    masks = torch.concat([1-masks, masks], dim=1) # Remove this line if background is not consider.
+    #self.slice_points_cache[(image_dims, crop_dims)] = grid
 
-    return images.view(-1,1,*self.crop_size), masks, grid, mask
+    # Pre-allocate tensors for images and masks
+    num_patches = grid.size(0)
+    images = torch.zeros((num_patches, 1, *self.crop_size), device=image.device, dtype=image.dtype)
+    masks = torch.zeros((num_patches, 1, *self.crop_size), device=mask.device, dtype=mask.dtype)
+
+    for idx, (i, j) in enumerate(grid):
+        images[idx] = TF.crop(image, i.item(), j.item(), self.crop_size[-2], self.crop_size[-1])
+        masks[idx] = TF.crop(mask, i.item(), j.item(), self.crop_size[-2], self.crop_size[-1])
+
+    structured_grid = torch.stack([grid[:, 0], grid[:, 1]], dim=0)
+
+    #masks = torch.concat([1-masks, masks], dim=1) # Remove this line if background is not consider.
+
+    return images, masks.long(), structured_grid, mask.long()
